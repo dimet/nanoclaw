@@ -363,6 +363,8 @@ function buildVolumeMounts(
   // Sync skills from container/skills/ into each group's .claude/skills/
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
   const skillsDst = path.join(groupSessionsDir, 'skills');
+  fs.mkdirSync(skillsDst, { recursive: true });
+  try { fs.chmodSync(skillsDst, 0o777); } catch { /* non-fatal */ }
   if (fs.existsSync(skillsSrc)) {
     for (const skillDir of fs.readdirSync(skillsSrc)) {
       const srcDir = path.join(skillsSrc, skillDir);
