@@ -501,6 +501,7 @@ export async function runContainerAgent(
 
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
+  try { fs.chmodSync(groupDir, 0o777); } catch { /* non-fatal */ }
 
   const mounts = buildVolumeMounts(group, input.isMain, input);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
