@@ -1,6 +1,11 @@
 /**
  * Container Runner for NanoClaw
  * Spawns agent execution in containers and handles IPC
+ *
+ * PATCH: Added per-channel token usage logging.
+ *   - ContainerOutput now includes optional `usage` field
+ *   - logTokenUsage() appends to store/token-usage.jsonl after each result
+ *   - Cost calculation covers haiku / sonnet / opus model families
  */
 import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs';
@@ -50,6 +55,12 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  /** Token usage reported by the agent-runner for this result. */
+  usage?: {
+    input_tokens: number;
+    output_tokens: number;
+    model: string;
+  };
 }
 
 interface VolumeMount {
@@ -57,6 +68,147 @@ interface VolumeMount {
   containerPath: string;
   readonly: boolean;
 }
+
+// ---------------------------------------------------------------------------
+// Token usage logging
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the shared partial token file written by agent-runner processes
+ * (both parent and sub-agents). Sum all lines, call logTokenUsage with the
+ * totals, then delete the file so it starts fresh for the next session.
+ *
+ * Using a separate partial file means sub-agent token usage — which never
+ * appears on the parent's stdout stream — is captured here instead.
+ */
+function aggregateAndClearTokenPartial(
+  groupDir: string,
+  groupFolder: string,
+  durationMs: number,
+): void {
+  const partialFile = path.join(groupDir, '.token-partial.jsonl');
+  if (!fs.existsSync(partialFile)) return;
+
+  try {
+    const raw = fs.readFileSync(partialFile, 'utf-8');
+    let totalInput = 0;
+    let totalOutput = 0;
+    let model = 'unknown';
+
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const record = JSON.parse(trimmed) as {
+          input_tokens?: number;
+          output_tokens?: number;
+          model?: string;
+        };
+        totalInput += record.input_tokens ?? 0;
+        totalOutput += record.output_tokens ?? 0;
+        if (record.model && record.model !== 'unknown') {
+          model = record.model;
+        }
+      } catch {
+        // Skip malformed lines
+      }
+    }
+
+    if (totalInput > 0 || totalOutput > 0) {
+      logTokenUsage(groupFolder, { input_tokens: totalInput, output_tokens: totalOutput, model }, durationMs);
+    }
+  } catch (err) {
+    logger.warn({ groupFolder, error: err }, 'Failed to aggregate token partial file');
+  }
+
+  // Clear the file regardless — stale data from a crashed session should not
+  // pollute the next session's totals.
+  try {
+    fs.unlinkSync(partialFile);
+  } catch {
+    // Ignore — file may have already been removed
+  }
+}
+
+/**
+ * Cost per million tokens for known model families.
+ * Matched by prefix so e.g. "claude-sonnet-4-6" hits the sonnet bucket.
+ */
+function computeCostUsd(
+  model: string,
+  inputTokens: number,
+  outputTokens: number,
+): number {
+  const m = model.toLowerCase();
+  let inputPricePerM = 0;
+  let outputPricePerM = 0;
+
+  if (m.includes('haiku')) {
+    inputPricePerM = 0.8;
+    outputPricePerM = 4.0;
+  } else if (m.includes('sonnet')) {
+    inputPricePerM = 3.0;
+    outputPricePerM = 15.0;
+  } else if (m.includes('opus')) {
+    inputPricePerM = 15.0;
+    outputPricePerM = 75.0;
+  }
+  // Unknown model → $0 (logged but not counted)
+
+  return (
+    (inputTokens / 1_000_000) * inputPricePerM +
+    (outputTokens / 1_000_000) * outputPricePerM
+  );
+}
+
+/**
+ * Append a token-usage record to store/token-usage.jsonl.
+ * One JSON object per line; safe for concurrent appends (O_APPEND).
+ */
+function logTokenUsage(
+  channel: string,
+  usage: { input_tokens: number; output_tokens: number; model: string },
+  durationMs: number,
+): void {
+  try {
+    const storeDir = path.join(process.cwd(), 'store');
+    fs.mkdirSync(storeDir, { recursive: true });
+    const logFile = path.join(storeDir, 'token-usage.jsonl');
+
+    const costUsd = computeCostUsd(
+      usage.model,
+      usage.input_tokens,
+      usage.output_tokens,
+    );
+
+    const record = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      channel,
+      input_tokens: usage.input_tokens,
+      output_tokens: usage.output_tokens,
+      model: usage.model,
+      cost_usd: parseFloat(costUsd.toFixed(6)),
+      duration_ms: durationMs,
+    });
+
+    fs.appendFileSync(logFile, record + '\n', { flag: 'a' });
+
+    logger.debug(
+      { channel, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens, cost_usd: costUsd },
+      'Token usage logged',
+    );
+  } catch (err) {
+    // Non-fatal — logging failure should never break agent execution
+    logger.warn(
+      { channel, error: err },
+      'Failed to write token usage log',
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Volume mounts
+// ---------------------------------------------------------------------------
 
 function buildVolumeMounts(
   group: RegisteredGroup,
@@ -140,6 +292,10 @@ function buildVolumeMounts(
       JSON.stringify(
         {
           env: {
+            // Assistant identity and model — available to the agent as env vars
+            ...(input.assistantName ? { ASSISTANT_NAME: input.assistantName } : {}),
+            ...(input.chatJid ? { PLATFORM: input.chatJid.startsWith('dc:') ? 'Discord' : 'Chat' } : {}),
+            ...(process.env.ANTHROPIC_MODEL ? { ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL } : {}),
             // Enable agent swarms (subagent orchestration)
             // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
             CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
@@ -149,12 +305,57 @@ function buildVolumeMounts(
             // Enable Claude's memory feature (persists user preferences between sessions)
             // https://code.claude.com/docs/en/memory#manage-auto-memory
             CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+            // Enable OpenTelemetry telemetry export (token usage, cost, traces)
+            // Collector runs on host at port 4318, receives OTLP/JSON
+            // https://docs.anthropic.com/en/docs/claude-code/telemetry
+            CLAUDE_CODE_ENABLE_TELEMETRY: '1',
+            OTEL_METRICS_EXPORTER: 'otlp',
+            OTEL_METRIC_EXPORT_INTERVAL: '30000',
+            OTEL_EXPORTER_OTLP_ENDPOINT: 'http://172.17.0.1:4318',
+            OTEL_EXPORTER_OTLP_PROTOCOL: 'http/json',
+            NO_PROXY: '172.17.0.1',
+            no_proxy: '172.17.0.1',
+            // Per-channel identifier for OTEL resource attribution
+            OTEL_RESOURCE_ATTRIBUTES: `channel=${group.folder}`,
           },
         },
         null,
         2,
       ) + '\n',
     );
+  }
+
+  // Ensure OTEL env vars are present in existing settings files.
+  // The creation block above only runs once; this updates any pre-existing file.
+  try {
+    const settingsRaw = fs.readFileSync(settingsFile, 'utf-8');
+    const settingsObj = JSON.parse(settingsRaw) as { env?: Record<string, string> };
+    if (!settingsObj.env) settingsObj.env = {};
+    let changed = false;
+    const otelVars: Record<string, string> = {
+      ...(input.assistantName ? { ASSISTANT_NAME: input.assistantName } : {}),
+      ...(input.chatJid ? { PLATFORM: input.chatJid.startsWith('dc:') ? 'Discord' : 'Chat' } : {}),
+      ...(process.env.ANTHROPIC_MODEL ? { ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL } : {}),
+      CLAUDE_CODE_ENABLE_TELEMETRY: '1',
+      OTEL_METRICS_EXPORTER: 'otlp',
+      OTEL_METRIC_EXPORT_INTERVAL: '30000',
+      OTEL_EXPORTER_OTLP_ENDPOINT: 'http://172.17.0.1:4318',
+      OTEL_EXPORTER_OTLP_PROTOCOL: 'http/json',
+      NO_PROXY: '172.17.0.1',
+      no_proxy: '172.17.0.1',
+      OTEL_RESOURCE_ATTRIBUTES: `channel=${group.folder}`,
+    };
+    for (const [k, v] of Object.entries(otelVars)) {
+      if (settingsObj.env[k] !== v) {
+        settingsObj.env[k] = v;
+        changed = true;
+      }
+    }
+    if (changed) {
+      fs.writeFileSync(settingsFile, JSON.stringify(settingsObj, null, 2) + '\n');
+    }
+  } catch {
+    // Non-fatal — settings file may be malformed; new creation block above handles fresh installs
   }
 
   // Sync skills from container/skills/ into each group's .claude/skills/
@@ -179,7 +380,12 @@ function buildVolumeMounts(
   const groupIpcDir = resolveGroupIpcPath(group.folder);
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  const inputDir = path.join(groupIpcDir, 'input');
+  fs.mkdirSync(inputDir, { recursive: true });
+  // Ensure containers (running as a different uid) can always unlink input files.
+  // mkdirSync does not change permissions on already-existing directories, so we
+  // chmod explicitly on every run to self-heal across service restarts.
+  try { fs.chmodSync(inputDir, 0o777); } catch { /* non-fatal */ }
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -389,6 +595,13 @@ export async function runContainerAgent(
             if (parsed.newSessionId) {
               newSessionId = parsed.newSessionId;
             }
+
+            // Log token usage if this result carries it
+            if (parsed.usage && (parsed.usage.input_tokens > 0 || parsed.usage.output_tokens > 0)) {
+              const durationMs = Date.now() - startTime;
+              logTokenUsage(group.folder, parsed.usage, durationMs);
+            }
+
             hadStreamingOutput = true;
             // Activity detected — reset the hard timeout
             resetTimeout();
@@ -462,6 +675,11 @@ export async function runContainerAgent(
     container.on('close', (code) => {
       clearTimeout(timeout);
       const duration = Date.now() - startTime;
+
+      // Aggregate sub-agent token usage from the shared partial file.
+      // This captures tokens from Agent(...) sub-processes that write directly
+      // to the file rather than through the parent's stdout stream.
+      aggregateAndClearTokenPartial(groupDir, group.folder, duration);
 
       if (timedOut) {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
@@ -633,6 +851,11 @@ export async function runContainerAgent(
         }
 
         const output: ContainerOutput = JSON.parse(jsonLine);
+
+        // Log token usage from legacy-mode output if present
+        if (output.usage && (output.usage.input_tokens > 0 || output.usage.output_tokens > 0)) {
+          logTokenUsage(group.folder, output.usage, duration);
+        }
 
         logger.info(
           {
