@@ -1,7 +1,10 @@
+import fs from 'fs';
+import path from 'path';
+
 import { Client, Events, GatewayIntentBits, Message, TextChannel, ChatInputCommandInteraction, GuildMember } from 'discord.js';
 import { SlashSkill, registerGuildCommands } from './discord-slash-commands.js';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME, TRIGGER_PATTERN, GROUPS_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -11,6 +14,32 @@ import {
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
+
+/** Parse [SEND_FILE:relative/path] markers out of a response string. */
+function parseFileMarkers(
+  text: string,
+  jid: string,
+  registeredGroups: () => Record<string, RegisteredGroup>,
+): { cleanText: string; files: string[] } {
+  const group = registeredGroups()[jid];
+  const files: string[] = [];
+
+  const cleanText = text.replace(/\[SEND_FILE:([^\]]+)\]/g, (_, rawPath: string) => {
+    if (!group) return '';
+    const base = path.resolve(GROUPS_DIR, group.folder);
+    const resolved = path.resolve(base, rawPath.trim());
+    // Guard against path traversal
+    if (!resolved.startsWith(base + path.sep) && resolved !== base) return '';
+    if (fs.existsSync(resolved)) {
+      files.push(resolved);
+    } else {
+      logger.warn({ resolved }, 'discord: SEND_FILE target not found');
+    }
+    return '';
+  }).trim();
+
+  return { cleanText, files };
+}
 
 export interface DiscordChannelOpts {
   onMessage: OnInboundMessage;
@@ -249,21 +278,27 @@ export class DiscordChannel implements Channel {
       const channelId = jid.replace(/^dc:/, '');
       const MAX_LENGTH = 2000;
 
+      const { cleanText, files } = parseFileMarkers(text, jid, this.opts.registeredGroups);
+      const messageText = cleanText || undefined;
+
       // If there's a pending slash command interaction, reply to it
       const interaction = this.pendingInteractions.get(jid);
       if (interaction) {
         this.pendingInteractions.delete(jid);
-        await interaction.editReply(text.slice(0, MAX_LENGTH));
-        // Send any overflow chunks as regular messages
-        if (text.length > MAX_LENGTH) {
+        await interaction.editReply({
+          content: messageText ? messageText.slice(0, MAX_LENGTH) : undefined,
+          files,
+        });
+        // Send overflow text as regular messages
+        if (messageText && messageText.length > MAX_LENGTH) {
           const channel = await this.client.channels.fetch(channelId);
           if (channel && 'send' in channel) {
-            for (let i = MAX_LENGTH; i < text.length; i += MAX_LENGTH) {
-              await (channel as TextChannel).send(text.slice(i, i + MAX_LENGTH));
+            for (let i = MAX_LENGTH; i < messageText.length; i += MAX_LENGTH) {
+              await (channel as TextChannel).send(messageText.slice(i, i + MAX_LENGTH));
             }
           }
         }
-        logger.info({ jid, length: text.length }, 'Discord interaction reply sent');
+        logger.info({ jid, files: files.length }, 'Discord interaction reply sent');
         return;
       }
 
@@ -276,15 +311,25 @@ export class DiscordChannel implements Channel {
 
       const textChannel = channel as TextChannel;
 
-      // Discord has a 2000 character limit per message — split if needed
-      if (text.length <= MAX_LENGTH) {
-        await textChannel.send(text);
-      } else {
-        for (let i = 0; i < text.length; i += MAX_LENGTH) {
-          await textChannel.send(text.slice(i, i + MAX_LENGTH));
+      if (files.length > 0) {
+        // Send files with the first chunk of text; overflow as follow-up messages
+        await textChannel.send({ content: messageText?.slice(0, MAX_LENGTH), files });
+        if (messageText && messageText.length > MAX_LENGTH) {
+          for (let i = MAX_LENGTH; i < messageText.length; i += MAX_LENGTH) {
+            await textChannel.send(messageText.slice(i, i + MAX_LENGTH));
+          }
+        }
+      } else if (messageText) {
+        // Plain text — split at 2000 chars if needed
+        if (messageText.length <= MAX_LENGTH) {
+          await textChannel.send(messageText);
+        } else {
+          for (let i = 0; i < messageText.length; i += MAX_LENGTH) {
+            await textChannel.send(messageText.slice(i, i + MAX_LENGTH));
+          }
         }
       }
-      logger.info({ jid, length: text.length }, 'Discord message sent');
+      logger.info({ jid, files: files.length }, 'Discord message sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Discord message');
     }
