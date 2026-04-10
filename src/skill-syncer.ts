@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { GROUPS_DIR } from './config.js';
+import { DATA_DIR } from './config.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 
@@ -19,7 +19,7 @@ interface RemoteSkill {
 }
 
 function skillsDir(): string {
-  return path.join(GROUPS_DIR, SKYCLAW_GROUP_FOLDER, 'skills');
+  return path.join(DATA_DIR, 'sessions', SKYCLAW_GROUP_FOLDER, '.claude', 'skills');
 }
 
 export async function syncSkills(): Promise<void> {
