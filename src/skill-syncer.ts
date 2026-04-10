@@ -13,6 +13,8 @@ const SKYCLAW_INSTANCE_ID = _env.SKYCLAW_INSTANCE_ID;
 const SKYCLAW_INSTANCE_SECRET = _env.SKYCLAW_INSTANCE_SECRET;
 const SKYCLAW_GROUP_FOLDER = _env.SKYCLAW_GROUP_FOLDER || 'discord_main';
 
+export type OnNewSkill = (slug: string, name: string, description: string) => void;
+
 interface RemoteSkill {
   slug: string;
   content: string | null;
@@ -22,7 +24,32 @@ function skillsDir(): string {
   return path.join(DATA_DIR, 'sessions', SKYCLAW_GROUP_FOLDER, '.claude', 'skills');
 }
 
-export async function syncSkills(): Promise<void> {
+function parseSkillMeta(content: string): { name: string; description: string } {
+  const lines = content.split('\n');
+
+  // Name: first # heading, stripping any subtitle after ":"
+  const headingLine = lines.find((l) => l.startsWith('# '));
+  const rawName = headingLine ? headingLine.replace(/^# /, '').trim() : '';
+  const name = rawName.split(':')[0].trim() || rawName;
+
+  // Description: first non-empty plain paragraph after the heading
+  let pastHeading = false;
+  let description = '';
+  for (const line of lines) {
+    if (line.startsWith('# ')) { pastHeading = true; continue; }
+    if (!pastHeading) continue;
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    // Skip headings, bold metadata lines, list items, code fences
+    if (trimmed.startsWith('#') || trimmed.startsWith('**') || trimmed.startsWith('-') || trimmed.startsWith('*') || trimmed.startsWith('`')) continue;
+    description = trimmed;
+    break;
+  }
+
+  return { name: name || 'New skill', description };
+}
+
+export async function syncSkills(onNewSkill?: OnNewSkill): Promise<void> {
   if (!SKYCLAW_API_URL || !SKYCLAW_INSTANCE_ID || !SKYCLAW_INSTANCE_SECRET) {
     return; // Not configured — skip silently
   }
@@ -54,13 +81,17 @@ export async function syncSkills(): Promise<void> {
       const skillFile = path.join(skillDir, 'SKILL.md');
 
       fs.mkdirSync(skillDir, { recursive: true });
-      const current = fs.existsSync(skillFile)
-        ? fs.readFileSync(skillFile, 'utf-8')
-        : null;
+      const isNew = !fs.existsSync(skillFile);
+      const current = isNew ? null : fs.readFileSync(skillFile, 'utf-8');
 
       if (current !== skill.content) {
         fs.writeFileSync(skillFile, skill.content, 'utf-8');
         logger.info({ slug: skill.slug }, 'skill-syncer: wrote skill');
+
+        if (isNew && onNewSkill) {
+          const { name, description } = parseSkillMeta(skill.content);
+          onNewSkill(skill.slug, name, description);
+        }
       }
     }
 
@@ -78,16 +109,18 @@ export async function syncSkills(): Promise<void> {
   }
 }
 
-export function startSkillSyncer(): void {
+export function startSkillSyncer(opts?: { onNewSkill?: OnNewSkill }): void {
   if (!SKYCLAW_API_URL || !SKYCLAW_INSTANCE_ID || !SKYCLAW_INSTANCE_SECRET) {
     return;
   }
 
   logger.info('skill-syncer: starting');
 
+  const notify = opts?.onNewSkill;
+
   // Initial sync
-  syncSkills().catch(() => {});
+  syncSkills(notify).catch(() => {});
 
   // Poll every 5 minutes
-  setInterval(() => syncSkills().catch(() => {}), POLL_INTERVAL_MS);
+  setInterval(() => syncSkills(notify).catch(() => {}), POLL_INTERVAL_MS);
 }

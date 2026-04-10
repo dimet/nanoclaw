@@ -49,7 +49,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound } from './router.js';
+import { findChannel, formatMessages, formatOutbound, routeOutbound } from './router.js';
 import {
   restoreRemoteControl,
   startRemoteControl,
@@ -582,7 +582,16 @@ async function main(): Promise<void> {
   }
 
   restoreRemoteControl();
-  startSkillSyncer();
+  startSkillSyncer({
+    onNewSkill: (slug, name, description) => {
+      const message = `✨ New skill added: **${name}**\n${description}\n\nUse \`/${slug}\` to try it.`;
+      for (const jid of Object.keys(registeredGroups)) {
+        routeOutbound(channels, jid, message).catch((err) => {
+          logger.debug({ jid, err }, 'skill-syncer: could not notify channel');
+        });
+      }
+    },
+  });
   startRefreshServer({
     getState: (): RuntimeState => ({
       channelsConnected: channels.length,
