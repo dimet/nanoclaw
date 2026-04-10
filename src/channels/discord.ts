@@ -197,7 +197,9 @@ export class DiscordChannel implements Channel {
       // Acknowledge immediately — Discord requires a response within 3 seconds.
       // Use reply() instead of deferReply() so the bot's display name appears
       // rather than the Discord application name in the "thinking" state.
-      await interaction.reply({ content: `_${ASSISTANT_NAME} is thinking..._` }).catch((err: unknown) => {
+      const skill = this.currentSkills.find((s) => s.slug === interaction.commandName);
+      const skillLabel = skill?.name ?? interaction.commandName;
+      await interaction.reply({ content: `_Using ${skillLabel}..._` }).catch((err: unknown) => {
         logger.warn({ err }, 'discord-slash: failed to send initial reply');
       });
       this.pendingInteractions.set(chatJid, interaction);
