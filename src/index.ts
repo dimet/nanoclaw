@@ -63,7 +63,7 @@ import {
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { startSkillSyncer } from './skill-syncer.js';
-import { startRefreshServer } from './refresh-server.js';
+import { startRefreshServer, RuntimeState } from './refresh-server.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
@@ -583,7 +583,13 @@ async function main(): Promise<void> {
 
   restoreRemoteControl();
   startSkillSyncer();
-  startRefreshServer();
+  startRefreshServer({
+    getState: (): RuntimeState => ({
+      channelsConnected: channels.length,
+      registeredGroups: Object.keys(registeredGroups).length,
+      messageLoopRunning,
+    }),
+  });
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
