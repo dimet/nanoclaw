@@ -586,9 +586,13 @@ async function main(): Promise<void> {
     onNewSkill: (slug, name, description) => {
       const message = `✨ New skill added: **${name}**\n${description}\n\nUse \`/${slug}\` to try it.`;
       for (const jid of Object.keys(registeredGroups)) {
-        routeOutbound(channels, jid, message).catch((err) => {
+        try {
+          routeOutbound(channels, jid, message).catch((err) => {
+            logger.debug({ jid, err }, 'skill-syncer: could not notify channel');
+          });
+        } catch (err) {
           logger.debug({ jid, err }, 'skill-syncer: could not notify channel');
-        });
+        }
       }
     },
   });
