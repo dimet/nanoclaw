@@ -144,6 +144,72 @@ function saveState(): void {
   setRouterState('last_agent_timestamp', JSON.stringify(lastAgentTimestamp));
 }
 
+/**
+ * Ensure a group's CLAUDE.md has the correct assistant name.
+ * - If the file doesn't exist: create it from the template with the correct name.
+ * - If it exists but has a stale "## Assistant Identity" section: update the name.
+ * - If it exists without an identity section: prepend one.
+ *
+ * This runs at startup (for all registered groups) and when a new group is
+ * registered, so the assistant name stays accurate after a git pull + restart.
+ */
+function ensureGroupClaudeMd(group: RegisteredGroup): void {
+  let groupDir: string;
+  try {
+    groupDir = resolveGroupFolderPath(group.folder);
+  } catch {
+    return;
+  }
+
+  const groupMdFile = path.join(groupDir, 'CLAUDE.md');
+  const identityMarker = '## Assistant Identity';
+  const identityBlock = [
+    '## Assistant Identity',
+    '',
+    `Your name is **${ASSISTANT_NAME}**. You are running as a Discord bot.`,
+    '',
+    '',
+  ].join('\n');
+
+  try {
+    if (!fs.existsSync(groupMdFile)) {
+      // Create from template with identity block prepended
+      const templateFile = path.join(
+        GROUPS_DIR,
+        group.isMain ? 'main' : 'global',
+        'CLAUDE.md',
+      );
+      const base = fs.existsSync(templateFile)
+        ? fs.readFileSync(templateFile, 'utf-8')
+        : '';
+      fs.writeFileSync(groupMdFile, identityBlock + base);
+      logger.info({ folder: group.folder }, 'Created CLAUDE.md with assistant identity');
+      return;
+    }
+
+    const content = fs.readFileSync(groupMdFile, 'utf-8');
+
+    if (!content.includes(identityMarker)) {
+      // Prepend identity block to existing file
+      fs.writeFileSync(groupMdFile, identityBlock + content);
+      logger.info({ folder: group.folder }, 'Prepended assistant identity to CLAUDE.md');
+      return;
+    }
+
+    // Update the name if it doesn't match
+    const updated = content.replace(
+      /Your name is \*\*[^*\n]+\*\*/,
+      `Your name is **${ASSISTANT_NAME}**`,
+    );
+    if (updated !== content) {
+      fs.writeFileSync(groupMdFile, updated);
+      logger.info({ folder: group.folder, name: ASSISTANT_NAME }, 'Updated assistant name in CLAUDE.md');
+    }
+  } catch (err) {
+    logger.warn({ folder: group.folder, err }, 'Failed to patch CLAUDE.md');
+  }
+}
+
 function registerGroup(jid: string, group: RegisteredGroup): void {
   let groupDir: string;
   try {
@@ -162,25 +228,8 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   // Create group folder
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
 
-  // Copy CLAUDE.md template into the new group folder so agents have
-  // identity and instructions from the first run.  (Fixes #1391)
-  const groupMdFile = path.join(groupDir, 'CLAUDE.md');
-  if (!fs.existsSync(groupMdFile)) {
-    const templateFile = path.join(
-      GROUPS_DIR,
-      group.isMain ? 'main' : 'global',
-      'CLAUDE.md',
-    );
-    if (fs.existsSync(templateFile)) {
-      let content = fs.readFileSync(templateFile, 'utf-8');
-      if (ASSISTANT_NAME !== 'Andy') {
-        content = content.replace(/^# Andy$/m, `# ${ASSISTANT_NAME}`);
-        content = content.replace(/You are Andy/g, `You are ${ASSISTANT_NAME}`);
-      }
-      fs.writeFileSync(groupMdFile, content);
-      logger.info({ folder: group.folder }, 'Created CLAUDE.md from template');
-    }
-  }
+  // Ensure CLAUDE.md exists with the correct assistant name.
+  ensureGroupClaudeMd(group);
 
   // Ensure a corresponding OneCLI agent exists (best-effort, non-blocking)
   ensureOneCLIAgent(jid, group);
@@ -576,10 +625,12 @@ async function main(): Promise<void> {
   logger.info('Database initialized');
   loadState();
 
-  // Ensure OneCLI agents exist for all registered groups.
-  // Recovers from missed creates (e.g. OneCLI was down at registration time).
+  // Ensure OneCLI agents exist and CLAUDE.md has the correct assistant name
+  // for all registered groups. Recovers from missed creates and stale names
+  // after a git pull + restart.
   for (const [jid, group] of Object.entries(registeredGroups)) {
     ensureOneCLIAgent(jid, group);
+    ensureGroupClaudeMd(group);
   }
 
   restoreRemoteControl();
