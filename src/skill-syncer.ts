@@ -39,10 +39,11 @@ export async function syncSkills(): Promise<void> {
       return;
     }
 
-    const { skills }: { skills: RemoteSkill[] } = await res.json();
+    const body = await res.json() as { skills: RemoteSkill[] };
     const dir = skillsDir();
 
     // Write installed skills
+    const { skills } = body;
     const installedSlugs = new Set<string>();
     for (const skill of skills) {
       if (!skill.content) continue;
