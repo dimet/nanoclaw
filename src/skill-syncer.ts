@@ -2,14 +2,16 @@ import fs from 'fs';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
+import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
-const SKYCLAW_API_URL = process.env.SKYCLAW_API_URL;
-const SKYCLAW_INSTANCE_ID = process.env.SKYCLAW_INSTANCE_ID;
-const SKYCLAW_INSTANCE_SECRET = process.env.SKYCLAW_INSTANCE_SECRET;
-const SKYCLAW_GROUP_FOLDER = process.env.SKYCLAW_GROUP_FOLDER || 'discord_main';
+const _env = readEnvFile(['SKYCLAW_API_URL', 'SKYCLAW_INSTANCE_ID', 'SKYCLAW_INSTANCE_SECRET', 'SKYCLAW_GROUP_FOLDER']);
+const SKYCLAW_API_URL = _env.SKYCLAW_API_URL;
+const SKYCLAW_INSTANCE_ID = _env.SKYCLAW_INSTANCE_ID;
+const SKYCLAW_INSTANCE_SECRET = _env.SKYCLAW_INSTANCE_SECRET;
+const SKYCLAW_GROUP_FOLDER = _env.SKYCLAW_GROUP_FOLDER || 'discord_main';
 
 interface RemoteSkill {
   slug: string;

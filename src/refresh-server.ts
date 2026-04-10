@@ -4,12 +4,14 @@ import http from 'http';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
+import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 import { syncSkills } from './skill-syncer.js';
 
 const PORT = 3001;
-const SKYCLAW_INSTANCE_SECRET = process.env.SKYCLAW_INSTANCE_SECRET;
-const SKYCLAW_GROUP_FOLDER = process.env.SKYCLAW_GROUP_FOLDER || 'discord_main';
+const _env = readEnvFile(['SKYCLAW_INSTANCE_SECRET', 'SKYCLAW_GROUP_FOLDER']);
+const SKYCLAW_INSTANCE_SECRET = _env.SKYCLAW_INSTANCE_SECRET;
+const SKYCLAW_GROUP_FOLDER = _env.SKYCLAW_GROUP_FOLDER || 'discord_main';
 
 export interface RuntimeState {
   channelsConnected: number;
