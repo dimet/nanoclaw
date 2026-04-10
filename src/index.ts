@@ -582,21 +582,22 @@ async function main(): Promise<void> {
   }
 
   restoreRemoteControl();
-  startSkillSyncer({
-    onNewSkill: (slug, name, description) => {
-      const message = `✨ New skill added: **${name}**\n${description}\n\nUse \`/${slug}\` to try it.`;
-      for (const jid of Object.keys(registeredGroups)) {
-        try {
-          routeOutbound(channels, jid, message).catch((err) => {
-            logger.debug({ jid, err }, 'skill-syncer: could not notify channel');
-          });
-        } catch (err) {
+  const notifyNewSkill = (slug: string, name: string, description: string) => {
+    const message = `✨ New skill added: **${name}**\n${description}\n\nUse \`/${slug}\` to try it.`;
+    for (const jid of Object.keys(registeredGroups)) {
+      try {
+        routeOutbound(channels, jid, message).catch((err) => {
           logger.debug({ jid, err }, 'skill-syncer: could not notify channel');
-        }
+        });
+      } catch (err) {
+        logger.debug({ jid, err }, 'skill-syncer: could not notify channel');
       }
-    },
-  });
+    }
+  };
+
+  startSkillSyncer({ onNewSkill: notifyNewSkill });
   startRefreshServer({
+    onNewSkill: notifyNewSkill,
     getState: (): RuntimeState => ({
       channelsConnected: channels.length,
       registeredGroups: Object.keys(registeredGroups).length,
