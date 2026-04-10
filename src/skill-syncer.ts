@@ -118,9 +118,9 @@ export function startSkillSyncer(opts?: { onNewSkill?: OnNewSkill }): void {
 
   const notify = opts?.onNewSkill;
 
-  // Initial sync
-  syncSkills(notify).catch(() => {});
+  // Sync without notifications on startup (channels not connected yet, skills already on disk)
+  syncSkills().catch(() => {});
 
-  // Poll every 5 minutes
+  // Poll every 5 minutes — notifications fire here once channels are up
   setInterval(() => syncSkills(notify).catch(() => {}), POLL_INTERVAL_MS);
 }
