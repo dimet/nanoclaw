@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
 import fs from 'fs';
 import http from 'http';
 import path from 'path';
@@ -73,10 +73,46 @@ export function startRefreshServer(opts?: { getState?: () => RuntimeState; onNew
     }
 
     if (req.method === 'POST' && req.url === '/refresh') {
-      res.writeHead(200, { 'Content-Type': 'application/json' }).end('{"ok":true}');
-      syncSkills(opts?.onNewSkill, opts?.onSkillsChanged).catch((err) =>
-        logger.warn({ err }, 'refresh-server: sync error'),
-      );
+      let body = '';
+      req.on('data', (chunk: Buffer) => { body += chunk; });
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' }).end('{"ok":true}');
+
+        // Provision any secrets included in the payload
+        if (body) {
+          try {
+            const parsed = JSON.parse(body) as { secrets?: unknown[] };
+            if (Array.isArray(parsed.secrets)) {
+              for (const s of parsed.secrets) {
+                const secret = s as { name: string; value: string; hostPattern: string; headerName: string };
+                const result = spawnSync('onecli', [
+                  'secrets', 'create',
+                  '--name', secret.name,
+                  '--type', 'generic',
+                  '--value', secret.value,
+                  '--host-pattern', secret.hostPattern,
+                  '--header-name', secret.headerName,
+                ], {
+                  env: { ...process.env, ONECLI_API_HOST: 'http://127.0.0.1:10254', ONECLI_URL: 'http://127.0.0.1:10254' },
+                  stdio: 'pipe',
+                  timeout: 10000,
+                });
+                if (result.status !== 0) {
+                  logger.warn({ stderr: result.stderr?.toString() }, 'refresh-server: onecli secrets create failed');
+                } else {
+                  logger.info({ name: secret.name }, 'refresh-server: secret provisioned');
+                }
+              }
+            }
+          } catch {
+            // ignore parse errors
+          }
+        }
+
+        syncSkills(opts?.onNewSkill, opts?.onSkillsChanged).catch((err: unknown) =>
+          logger.warn({ err }, 'refresh-server: sync error'),
+        );
+      });
       return;
     }
 
