@@ -169,6 +169,23 @@ export class DiscordChannel implements Channel {
         console.log(
           `  Use /chatid command or check channel IDs in Discord settings\n`,
         );
+
+        // Set per-guild nickname to match the configured assistant name.
+        // This overrides the Discord application name without requiring a
+        // global username change (which is heavily rate-limited).
+        for (const guild of readyClient.guilds.cache.values()) {
+          guild.members.me?.setNickname(ASSISTANT_NAME).catch((err) => {
+            logger.debug({ guild: guild.name, err }, 'Could not set guild nickname');
+          });
+        }
+
+        // Also set nickname in any guild the bot joins later
+        readyClient.on(Events.GuildCreate, (guild) => {
+          guild.members.me?.setNickname(ASSISTANT_NAME).catch((err) => {
+            logger.debug({ guild: guild.name, err }, 'Could not set guild nickname on join');
+          });
+        });
+
         resolve();
       });
 
