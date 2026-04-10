@@ -73,6 +73,7 @@ export async function syncSkills(onNewSkill?: OnNewSkill): Promise<void> {
 
     // Write installed skills
     const { skills } = body;
+    logger.info({ count: skills.length, notify: !!onNewSkill, dir }, 'skill-syncer: syncing');
     const installedSlugs = new Set<string>();
     for (const skill of skills) {
       if (!skill.content) continue;
@@ -86,12 +87,15 @@ export async function syncSkills(onNewSkill?: OnNewSkill): Promise<void> {
 
       if (current !== skill.content) {
         fs.writeFileSync(skillFile, skill.content, 'utf-8');
-        logger.info({ slug: skill.slug }, 'skill-syncer: wrote skill');
+        logger.info({ slug: skill.slug, isNew, willNotify: isNew && !!onNewSkill }, 'skill-syncer: wrote skill');
 
         if (isNew && onNewSkill) {
           const { name, description } = parseSkillMeta(skill.content);
+          logger.info({ slug: skill.slug, name }, 'skill-syncer: announcing new skill');
           onNewSkill(skill.slug, name, description);
         }
+      } else {
+        logger.debug({ slug: skill.slug }, 'skill-syncer: skill unchanged');
       }
     }
 
@@ -118,9 +122,11 @@ export function startSkillSyncer(opts?: { onNewSkill?: OnNewSkill }): void {
 
   const notify = opts?.onNewSkill;
 
-  // Sync without notifications on startup (channels not connected yet, skills already on disk)
-  syncSkills().catch(() => {});
+  // Delay the first sync so Discord channels have time to connect.
+  // Notifications are active from the start — any skill added between
+  // deploys will announce on this first run.
+  setTimeout(() => syncSkills(notify).catch(() => {}), 15_000);
 
-  // Poll every 5 minutes — notifications fire here once channels are up
+  // Poll every 5 minutes
   setInterval(() => syncSkills(notify).catch(() => {}), POLL_INTERVAL_MS);
 }
