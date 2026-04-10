@@ -52,7 +52,7 @@ function buildHealthPayload(getState?: () => RuntimeState): string {
   });
 }
 
-export function startRefreshServer(opts?: { getState?: () => RuntimeState; onNewSkill?: import('./skill-syncer.js').OnNewSkill }): void {
+export function startRefreshServer(opts?: { getState?: () => RuntimeState; onNewSkill?: import('./skill-syncer.js').OnNewSkill; onSkillsChanged?: import('./skill-syncer.js').OnSkillsChanged }): void {
   if (!SKYCLAW_INSTANCE_SECRET) {
     return; // Not configured — skip
   }
@@ -74,7 +74,7 @@ export function startRefreshServer(opts?: { getState?: () => RuntimeState; onNew
 
     if (req.method === 'POST' && req.url === '/refresh') {
       res.writeHead(200, { 'Content-Type': 'application/json' }).end('{"ok":true}');
-      syncSkills(opts?.onNewSkill).catch((err) =>
+      syncSkills(opts?.onNewSkill, opts?.onSkillsChanged).catch((err) =>
         logger.warn({ err }, 'refresh-server: sync error'),
       );
       return;

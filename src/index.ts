@@ -62,7 +62,8 @@ import {
   shouldDropMessage,
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { startSkillSyncer } from './skill-syncer.js';
+import { startSkillSyncer, getInstalledSkills } from './skill-syncer.js';
+import { DiscordChannel } from './channels/discord.js';
 import { startRefreshServer, RuntimeState } from './refresh-server.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -595,9 +596,23 @@ async function main(): Promise<void> {
     }
   };
 
-  startSkillSyncer({ onNewSkill: notifyNewSkill });
+  const onSkillsChanged: import('./skill-syncer.js').OnSkillsChanged = (skills) => {
+    for (const channel of channels) {
+      if (channel instanceof DiscordChannel) {
+        channel.registerSlashCommandsForAllGuilds(skills).catch((err) => {
+          logger.warn({ err }, 'skill-syncer: failed to register slash commands');
+        });
+      }
+    }
+  };
+
+  startSkillSyncer({
+    onNewSkill: notifyNewSkill,
+    onSkillsChanged,
+  });
   startRefreshServer({
     onNewSkill: notifyNewSkill,
+    onSkillsChanged,
     getState: (): RuntimeState => ({
       channelsConnected: channels.length,
       registeredGroups: Object.keys(registeredGroups).length,
@@ -716,6 +731,13 @@ async function main(): Promise<void> {
   if (channels.length === 0) {
     logger.fatal('No channels connected');
     process.exit(1);
+  }
+
+  // Register any skills already on disk as slash commands immediately (before first API sync)
+  const existingSkills = getInstalledSkills();
+  if (existingSkills.length > 0) {
+    onSkillsChanged(existingSkills);
+    logger.info({ count: existingSkills.length }, 'Registered existing skills as slash commands');
   }
 
   // Start subsystems (independently of connection handler)

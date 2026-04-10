@@ -1,4 +1,5 @@
-import { Client, Events, GatewayIntentBits, Message, TextChannel } from 'discord.js';
+import { Client, Events, GatewayIntentBits, Message, TextChannel, ChatInputCommandInteraction, GuildMember } from 'discord.js';
+import { SlashSkill, registerGuildCommands } from './discord-slash-commands.js';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
@@ -23,6 +24,8 @@ export class DiscordChannel implements Channel {
   private client: Client | null = null;
   private opts: DiscordChannelOpts;
   private botToken: string;
+  private currentSkills: SlashSkill[] = [];
+  private pendingInteractions = new Map<string, ChatInputCommandInteraction>();
 
   constructor(botToken: string, opts: DiscordChannelOpts) {
     this.botToken = botToken;
@@ -154,6 +157,42 @@ export class DiscordChannel implements Channel {
       );
     });
 
+    // Handle slash command interactions
+    this.client.on(Events.InteractionCreate, async (interaction) => {
+      if (!interaction.isChatInputCommand()) return;
+
+      const chatJid = `dc:${interaction.channelId}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      // Acknowledge immediately — Discord requires a response within 3 seconds
+      await interaction.deferReply().catch((err) => {
+        logger.warn({ err }, 'discord-slash: failed to defer reply');
+      });
+      this.pendingInteractions.set(chatJid, interaction);
+
+      const input = interaction.options.getString('input') ?? '';
+      const content = `@${ASSISTANT_NAME} /${interaction.commandName}${input ? ` ${input}` : ''}`;
+      const timestamp = new Date().toISOString();
+      const senderName =
+        (interaction.member as GuildMember | null)?.displayName ??
+        interaction.user.displayName ??
+        interaction.user.username;
+
+      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'discord', true);
+      this.opts.onMessage(chatJid, {
+        id: interaction.id,
+        chat_jid: chatJid,
+        sender: interaction.user.id,
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+
+      logger.info({ chatJid, command: interaction.commandName }, 'Discord slash command received');
+    });
+
     // Handle errors gracefully
     this.client.on(Events.Error, (err) => {
       logger.error({ err: err.message }, 'Discord client error');
@@ -174,16 +213,21 @@ export class DiscordChannel implements Channel {
         // This overrides the Discord application name without requiring a
         // global username change (which is heavily rate-limited).
         for (const guild of readyClient.guilds.cache.values()) {
-          guild.members.me?.setNickname(ASSISTANT_NAME).catch((err) => {
-            logger.debug({ guild: guild.name, err }, 'Could not set guild nickname');
+          guild.members.me?.setNickname(ASSISTANT_NAME).catch((err: unknown) => {
+            logger.warn({ guild: guild.name, err }, 'Could not set guild nickname');
           });
         }
 
-        // Also set nickname in any guild the bot joins later
+        // Also set nickname and register slash commands in any guild the bot joins later
         readyClient.on(Events.GuildCreate, (guild) => {
           guild.members.me?.setNickname(ASSISTANT_NAME).catch((err) => {
             logger.debug({ guild: guild.name, err }, 'Could not set guild nickname on join');
           });
+          if (this.currentSkills.length > 0) {
+            registerGuildCommands(this.botToken, guild.id, this.currentSkills).catch((err: unknown) => {
+              logger.warn({ guild: guild.name, err }, 'discord-slash: failed to register commands on guild join');
+            });
+          }
         });
 
         resolve();
@@ -201,6 +245,26 @@ export class DiscordChannel implements Channel {
 
     try {
       const channelId = jid.replace(/^dc:/, '');
+      const MAX_LENGTH = 2000;
+
+      // If there's a pending slash command interaction, reply to it
+      const interaction = this.pendingInteractions.get(jid);
+      if (interaction) {
+        this.pendingInteractions.delete(jid);
+        await interaction.editReply(text.slice(0, MAX_LENGTH));
+        // Send any overflow chunks as regular messages
+        if (text.length > MAX_LENGTH) {
+          const channel = await this.client.channels.fetch(channelId);
+          if (channel && 'send' in channel) {
+            for (let i = MAX_LENGTH; i < text.length; i += MAX_LENGTH) {
+              await (channel as TextChannel).send(text.slice(i, i + MAX_LENGTH));
+            }
+          }
+        }
+        logger.info({ jid, length: text.length }, 'Discord interaction reply sent');
+        return;
+      }
+
       const channel = await this.client.channels.fetch(channelId);
 
       if (!channel || !('send' in channel)) {
@@ -211,7 +275,6 @@ export class DiscordChannel implements Channel {
       const textChannel = channel as TextChannel;
 
       // Discord has a 2000 character limit per message — split if needed
-      const MAX_LENGTH = 2000;
       if (text.length <= MAX_LENGTH) {
         await textChannel.send(text);
       } else {
@@ -223,6 +286,17 @@ export class DiscordChannel implements Channel {
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Discord message');
     }
+  }
+
+  async registerSlashCommandsForAllGuilds(skills: SlashSkill[]): Promise<void> {
+    this.currentSkills = skills;
+    if (!this.client?.isReady()) return;
+    for (const guild of this.client.guilds.cache.values()) {
+      await registerGuildCommands(this.botToken, guild.id, skills).catch((err: unknown) => {
+        logger.warn({ guild: guild.name, err }, 'discord-slash: failed to register commands');
+      });
+    }
+    logger.info({ count: skills.length }, 'discord-slash: registered commands in all guilds');
   }
 
   isConnected(): boolean {

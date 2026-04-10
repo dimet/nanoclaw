@@ -4,6 +4,7 @@ import path from 'path';
 import { DATA_DIR } from './config.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
+import type { SlashSkill } from './channels/discord-slash-commands.js';
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -14,6 +15,7 @@ const SKYCLAW_INSTANCE_SECRET = _env.SKYCLAW_INSTANCE_SECRET;
 const SKYCLAW_GROUP_FOLDER = _env.SKYCLAW_GROUP_FOLDER || 'discord_main';
 
 export type OnNewSkill = (slug: string, name: string, description: string) => void;
+export type OnSkillsChanged = (skills: SlashSkill[]) => void;
 
 interface RemoteSkill {
   slug: string;
@@ -49,7 +51,23 @@ function parseSkillMeta(content: string): { name: string; description: string } 
   return { name: name || 'New skill', description };
 }
 
-export async function syncSkills(onNewSkill?: OnNewSkill): Promise<void> {
+export function getInstalledSkills(): SlashSkill[] {
+  const dir = skillsDir();
+  if (!fs.existsSync(dir)) return [];
+  const skills: SlashSkill[] = [];
+  for (const slug of fs.readdirSync(dir)) {
+    const skillFile = path.join(dir, slug, 'SKILL.md');
+    if (!fs.existsSync(skillFile)) continue;
+    try {
+      const content = fs.readFileSync(skillFile, 'utf-8');
+      const { name, description } = parseSkillMeta(content);
+      skills.push({ slug, name, description });
+    } catch { /* skip unreadable */ }
+  }
+  return skills;
+}
+
+export async function syncSkills(onNewSkill?: OnNewSkill, onSkillsChanged?: OnSkillsChanged): Promise<void> {
   if (!SKYCLAW_API_URL || !SKYCLAW_INSTANCE_ID || !SKYCLAW_INSTANCE_SECRET) {
     return; // Not configured — skip silently
   }
@@ -75,6 +93,7 @@ export async function syncSkills(onNewSkill?: OnNewSkill): Promise<void> {
     const { skills } = body;
     logger.info({ count: skills.length, notify: !!onNewSkill, dir }, 'skill-syncer: syncing');
     const installedSlugs = new Set<string>();
+    const allSlashSkills: SlashSkill[] = [];
     for (const skill of skills) {
       if (!skill.content) continue;
       installedSlugs.add(skill.slug);
@@ -85,12 +104,14 @@ export async function syncSkills(onNewSkill?: OnNewSkill): Promise<void> {
       const isNew = !fs.existsSync(skillFile);
       const current = isNew ? null : fs.readFileSync(skillFile, 'utf-8');
 
+      const { name, description } = parseSkillMeta(skill.content);
+      allSlashSkills.push({ slug: skill.slug, name, description });
+
       if (current !== skill.content) {
         fs.writeFileSync(skillFile, skill.content, 'utf-8');
         logger.info({ slug: skill.slug, isNew, willNotify: isNew && !!onNewSkill }, 'skill-syncer: wrote skill');
 
         if (isNew && onNewSkill) {
-          const { name, description } = parseSkillMeta(skill.content);
           logger.info({ slug: skill.slug, name }, 'skill-syncer: announcing new skill');
           onNewSkill(skill.slug, name, description);
         }
@@ -98,6 +119,8 @@ export async function syncSkills(onNewSkill?: OnNewSkill): Promise<void> {
         logger.debug({ slug: skill.slug }, 'skill-syncer: skill unchanged');
       }
     }
+
+    if (onSkillsChanged) onSkillsChanged(allSlashSkills);
 
     // Remove skills that are no longer installed
     if (fs.existsSync(dir)) {
@@ -113,7 +136,7 @@ export async function syncSkills(onNewSkill?: OnNewSkill): Promise<void> {
   }
 }
 
-export function startSkillSyncer(opts?: { onNewSkill?: OnNewSkill }): void {
+export function startSkillSyncer(opts?: { onNewSkill?: OnNewSkill; onSkillsChanged?: OnSkillsChanged }): void {
   if (!SKYCLAW_API_URL || !SKYCLAW_INSTANCE_ID || !SKYCLAW_INSTANCE_SECRET) {
     return;
   }
@@ -121,12 +144,13 @@ export function startSkillSyncer(opts?: { onNewSkill?: OnNewSkill }): void {
   logger.info('skill-syncer: starting');
 
   const notify = opts?.onNewSkill;
+  const onChange = opts?.onSkillsChanged;
 
   // Delay the first sync so Discord channels have time to connect.
   // Notifications are active from the start — any skill added between
   // deploys will announce on this first run.
-  setTimeout(() => syncSkills(notify).catch(() => {}), 15_000);
+  setTimeout(() => syncSkills(notify, onChange).catch(() => {}), 15_000);
 
   // Poll every 5 minutes
-  setInterval(() => syncSkills(notify).catch(() => {}), POLL_INTERVAL_MS);
+  setInterval(() => syncSkills(notify, onChange).catch(() => {}), POLL_INTERVAL_MS);
 }
